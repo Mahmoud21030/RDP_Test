@@ -14,8 +14,6 @@ jobs:
       - name: Setup SSH key
         run: |
           mkdir $env:USERPROFILE\.ssh
-          echo "$env:SSH_PRIVATE_KEY" | Out-File $env:USERPROFILE\.ssh\id_rsa -Encoding ascii
-          icacls $env:USERPROFILE\.ssh\id_rsa /inheritance:r /grant:r "$($env:USERNAME):(R,W)"
           ssh -p 443 -R0:127.0.0.1:3389 tcp@free.pinggy.io >> $env:USERPROFILE\.ssh\known_hosts
 
       - name: Retry SSH tunnel
