@@ -1,0 +1,44 @@
+name: Expose RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup SSH key
+        run: |
+          mkdir $env:USERPROFILE\.ssh
+          echo "$env:SSH_PRIVATE_KEY" | Out-File $env:USERPROFILE\.ssh\id_rsa -Encoding ascii
+          icacls $env:USERPROFILE\.ssh\id_rsa /inheritance:r /grant:r "$($env:USERNAME):(R,W)"
+          ssh-keyscan -p 443 free.pinggy.io >> $env:USERPROFILE\.ssh\known_hosts
+
+      - name: Retry SSH tunnel
+        shell: pwsh
+        run: |
+          $success = $false
+          while (-not $success) {
+              try {
+                  ssh -i $env:USERPROFILE\.ssh\id_rsa -o StrictHostKeyChecking=no -p 443 -R0:127.0.0.1:3389 qr+tcp@free.pinggy.io -f -N
+                  $success = $true
+                  Write-Host "SSH tunnel established!"
+              } catch {
+                  Write-Host "SSH failed, retrying in 5s..."
+                  Start-Sleep -Seconds 5
+              }
+          }
+
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          net user omara123 omara123 /add
+          net localgroup administrators omara123 /add
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+
