@@ -4,39 +4,348 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Setup SSH key
-        run: |
-          mkdir $env:USERPROFILE\.ssh
-          ssh -p 443 -R0:127.0.0.1:3389 tcp@free.pinggy.io >> $env:USERPROFILE\.ssh\known_hosts
-
-      - name: Retry SSH tunnel
+      - name: Enable RDP and create user
         shell: pwsh
         run: |
-          $success = $false
-          while (-not $success) {
-              try {
-                  ssh -p 443 -R0:127.0.0.1:3389 tcp@free.pinggy.io -f -N
-                  $success = $true
-                  Write-Host "SSH tunnel established!"
-              } catch {
-                  Write-Host "SSH failed, retrying in 5s..."
-                  Start-Sleep -Seconds 5
+          $ErrorActionPreference = "Stop"
+
+          $user = "omara123"
+
+          # Generate a strong random password
+          $bytes = New-Object byte[] 18
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+
+          $random = [Convert]::ToBase64String($bytes)
+          $random = $random.Replace("/", "A")
+          $random = $random.Replace("+", "B")
+          $random = $random.Replace("=", "")
+
+          $password = "Gh!1aA$random"
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Create or update user
+          $existingUser = Get-LocalUser `
+            -Name $user `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+
+              Set-LocalUser `
+                -Name $user `
+                -Password $securePassword
+
+          } else {
+
+              New-LocalUser `
+                -Name $user `
+                -Password $securePassword `
+                -PasswordNeverExpires `
+                -AccountNeverExpires `
+                -Description "Temporary GitHub Actions RDP user"
+          }
+
+          # Add user to Administrators
+          $adminMember = Get-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $user `
+            -ErrorAction SilentlyContinue
+
+          if (-not $adminMember) {
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $user
+          }
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Start RDP service
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Start-Service `
+            -Name "TermService"
+
+          # Enable Windows Firewall rules for RDP
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          # Wait until RDP is actually listening
+          $listening = $false
+
+          for ($i = 0; $i -lt 30; $i++) {
+
+              $rdpPort = Get-NetTCPConnection `
+                -LocalPort 3389 `
+                -State Listen `
+                -ErrorAction SilentlyContinue
+
+              if ($rdpPort) {
+                  $listening = $true
+                  break
+              }
+
+              Start-Sleep -Seconds 1
+          }
+
+          if (-not $listening) {
+              throw "RDP is not listening on port 3389."
+          }
+
+          # Save credentials for next steps
+          "RDP_USER=$user" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          # Show credentials in GitHub Job Summary
+          Add-Content $env:GITHUB_STEP_SUMMARY "## RDP Credentials"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "- **Username:** ``$user``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- **Password:** ``$password``"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+
+          Write-Host "RDP is listening on port 3389."
+
+      - name: Create SSH key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sshDir = Join-Path `
+            $env:USERPROFILE `
+            ".ssh"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $sshDir `
+            -Force | Out-Null
+
+          $keyPath = Join-Path `
+            $sshDir `
+            "id_ed25519"
+
+          if (-not (Test-Path $keyPath)) {
+
+              & ssh-keygen.exe `
+                -t ed25519 `
+                -N "" `
+                -f $keyPath `
+                -q
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "ssh-keygen failed with exit code $LASTEXITCODE"
               }
           }
 
-      - name: Enable RDP
+          Write-Host "SSH key ready."
+
+      - name: Start Pinggy tunnel
         shell: pwsh
         run: |
-          net user omara123 omara123 /add
-          net localgroup administrators omara123 /add
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          $ErrorActionPreference = "Stop"
+
+          $stdoutFile = Join-Path `
+            $env:RUNNER_TEMP `
+            "pinggy-out.log"
+
+          $stderrFile = Join-Path `
+            $env:RUNNER_TEMP `
+            "pinggy-err.log"
 
 
+          function Start-Pinggy {
+
+              Remove-Item `
+                $stdoutFile, $stderrFile `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              $sshArgs = @(
+
+                  "-p", "443",
+
+                  "-o", "StrictHostKeyChecking=no",
+
+                  "-o", "UserKnownHostsFile=NUL",
+
+                  "-o", "ServerAliveInterval=30",
+
+                  "-o", "ServerAliveCountMax=3",
+
+                  "-R", "0:127.0.0.1:3389",
+
+                  "-L", "4300:127.0.0.1:4300",
+
+                  "tcp@free.pinggy.io"
+              )
+
+              $process = Start-Process `
+                -FilePath "ssh.exe" `
+                -ArgumentList $sshArgs `
+                -PassThru `
+                -RedirectStandardOutput $stdoutFile `
+                -RedirectStandardError $stderrFile
+
+              return $process
+          }
+
+
+          function Get-PinggyUrl {
+
+              for ($i = 0; $i -lt 45; $i++) {
+
+                  try {
+
+                      $result = Invoke-RestMethod `
+                        -Uri "http://127.0.0.1:4300/urls" `
+                        -TimeoutSec 3
+
+                      $tcpUrl = $result.urls |
+                        Where-Object {
+                            $_ -like "tcp://*"
+                        } |
+                        Select-Object -First 1
+
+                      if ($tcpUrl) {
+                          return $tcpUrl
+                      }
+
+                  } catch {
+
+                      Start-Sleep -Seconds 2
+                  }
+              }
+
+              return $null
+          }
+
+
+          while ($true) {
+
+              Write-Host ""
+              Write-Host "Starting Pinggy TCP tunnel..."
+
+              $pinggy = Start-Pinggy
+
+              $url = Get-PinggyUrl
+
+
+              if (-not $url) {
+
+                  Write-Host ""
+                  Write-Host "Pinggy did not provide a TCP URL."
+
+                  if (Test-Path $stdoutFile) {
+
+                      Write-Host ""
+                      Write-Host "----- Pinggy stdout -----"
+
+                      Get-Content $stdoutFile
+                  }
+
+                  if (Test-Path $stderrFile) {
+
+                      Write-Host ""
+                      Write-Host "----- Pinggy stderr -----"
+
+                      Get-Content $stderrFile
+                  }
+
+                  if (-not $pinggy.HasExited) {
+
+                      Stop-Process `
+                        -Id $pinggy.Id `
+                        -Force
+                  }
+
+                  Write-Host ""
+                  Write-Host "Retrying in 10 seconds..."
+
+                  Start-Sleep -Seconds 10
+
+                  continue
+              }
+
+
+              $uri = [Uri]$url
+
+              $rdpAddress = "$($uri.Host):$($uri.Port)"
+
+
+              Write-Host ""
+              Write-Host "=============================================="
+              Write-Host ""
+              Write-Host "             RDP IS READY"
+              Write-Host ""
+              Write-Host " Address : $rdpAddress"
+              Write-Host " Username: $env:RDP_USER"
+              Write-Host ""
+              Write-Host " Password is in GitHub Job Summary"
+              Write-Host ""
+              Write-Host "=============================================="
+              Write-Host ""
+
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                "### Pinggy RDP Address"
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                ""
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                "- **Address:** ``$rdpAddress``"
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                "- **Full URL:** ``$url``"
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                ""
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                "> Open Remote Desktop Connection and enter the Address above."
+
+              Add-Content `
+                $env:GITHUB_STEP_SUMMARY `
+                ""
+
+
+              # Wait until Pinggy disconnects
+              while (-not $pinggy.HasExited) {
+
+                  Start-Sleep -Seconds 15
+
+                  $pinggy.Refresh()
+              }
+
+
+              Write-Host ""
+              Write-Host "Pinggy disconnected."
+
+              Write-Host "Reconnecting in 5 seconds..."
+
+              Start-Sleep -Seconds 5
+          }
